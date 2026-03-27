@@ -7,7 +7,7 @@ A script to partition, format, and persistently mount a **GCP Persistent Disk** 
 ## Usage
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<your-username>/<your-repo>/main/setup-disk.sh \
+curl -fsSL https://raw.githubusercontent.com/DailyBalls/public-scripts/main/setup-disk.sh \
   | sudo bash -s -- <disk> <mount-path>
 ```
 
@@ -22,13 +22,13 @@ curl -fsSL https://raw.githubusercontent.com/<your-username>/<your-repo>/main/se
 
 **Mount `/dev/sdb` at `/mnt/data`**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<your-username>/<your-repo>/main/setup-disk.sh \
+curl -fsSL https://raw.githubusercontent.com/DailyBalls/public-scripts/main/setup-disk.sh \
   | sudo bash -s -- /dev/sdb /mnt/data
 ```
 
 **Mount an NVMe disk at `/mnt/storage`**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<your-username>/<your-repo>/main/setup-disk.sh \
+curl -fsSL https://raw.githubusercontent.com/DailyBalls/public-scripts/main/setup-disk.sh \
   | sudo bash -s -- /dev/nvme0n1 /mnt/storage
 ```
 

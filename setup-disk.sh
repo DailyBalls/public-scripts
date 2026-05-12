@@ -4,6 +4,10 @@
 # Usage : curl -fsSL <raw-url> | sudo bash -s -- <disk> <mount-path>
 # Example: curl -fsSL https://raw.githubusercontent.com/.../setup-disk.sh \
 #            | sudo bash -s -- /dev/sdb /mnt/data
+#
+# New features:
+#   • Detects existing data in the target mount path and migrates it
+#   • Docker-aware: stops Docker before migrating /var/lib/docker, restores state
 # =============================================================================
 set -euo pipefail
 
@@ -26,6 +30,138 @@ DISK="$1"
 MOUNT_PATH="$2"
 FSTAB="/etc/fstab"
 
+# Normalise mount path (strip trailing slash) for reliable comparisons
+MOUNT_PATH="${MOUNT_PATH%/}"
+
+# ── Docker detection helpers ──────────────────────────────────────────────────
+DOCKER_DATA_ROOT="/var/lib/docker"   # canonical Docker data root
+DOCKER_WAS_RUNNING=false             # track original Docker state
+
+is_docker_path() {
+  # Returns 0 (true) if MOUNT_PATH is or is a parent of the Docker data root,
+  # or IS the Docker data root itself.
+  local canonical_mount
+  canonical_mount=$(realpath -m "$MOUNT_PATH" 2>/dev/null || echo "$MOUNT_PATH")
+  local canonical_docker
+  canonical_docker=$(realpath -m "$DOCKER_DATA_ROOT" 2>/dev/null || echo "$DOCKER_DATA_ROOT")
+
+  # Also honour a custom dockerd --data-root if daemon.json exists
+  if command -v docker &>/dev/null && [[ -f /etc/docker/daemon.json ]]; then
+    local custom_root
+    custom_root=$(python3 -c \
+      "import json,sys; d=json.load(open('/etc/docker/daemon.json')); print(d.get('data-root',''))" \
+      2>/dev/null || true)
+    [[ -n "$custom_root" ]] && canonical_docker=$(realpath -m "$custom_root" 2>/dev/null || echo "$custom_root")
+  fi
+
+  [[ "$canonical_mount" == "$canonical_docker" || \
+     "$canonical_docker" == "$canonical_mount"/* ]]
+}
+
+docker_stop_if_needed() {
+  if ! command -v docker &>/dev/null; then return; fi
+  if ! is_docker_path; then return; fi
+
+  echo
+  warn "Mount path '$MOUNT_PATH' overlaps with the Docker data root."
+  warn "Docker must be stopped before data migration to avoid corruption."
+
+  if systemctl is-active --quiet docker 2>/dev/null; then
+    DOCKER_WAS_RUNNING=true
+    info "Stopping Docker daemon and socket..."
+    systemctl stop docker.socket docker 2>/dev/null || systemctl stop docker 2>/dev/null
+    success "Docker stopped."
+  else
+    info "Docker is already stopped."
+    DOCKER_WAS_RUNNING=false
+  fi
+}
+
+docker_restore_if_needed() {
+  if ! command -v docker &>/dev/null; then return; fi
+  if ! is_docker_path; then return; fi
+
+  if $DOCKER_WAS_RUNNING; then
+    info "Restoring Docker to its previous running state..."
+    systemctl start docker
+    success "Docker restarted."
+  else
+    info "Docker was not running before; leaving it stopped."
+  fi
+}
+
+# ── Pre-migration: stop Docker if needed, copy existing data ─────────────────
+migrate_existing_data() {
+  # Only act when the directory already exists and contains something
+  if [[ ! -d "$MOUNT_PATH" ]]; then
+    info "Mount path '$MOUNT_PATH' does not exist yet — no migration needed."
+    return
+  fi
+
+  # Count items (hidden files included), excluding . and ..
+  local item_count
+  item_count=$(find "$MOUNT_PATH" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l || echo 0)
+
+  if [[ "$item_count" -eq 0 ]]; then
+    info "Mount path '$MOUNT_PATH' is empty — no migration needed."
+    return
+  fi
+
+  echo
+  info "Mount path '$MOUNT_PATH' exists and contains $item_count item(s)."
+  warn "Existing data will be copied to the new disk before mounting."
+
+  # ── stop Docker if this is a Docker path ──────────────────────────────────
+  docker_stop_if_needed
+
+  # ── temporary staging directory for the new disk ──────────────────────────
+  local staging
+  staging=$(mktemp -d /tmp/new-disk-staging.XXXXXX)
+  info "Mounting new partition temporarily at '$staging' for data copy..."
+
+  if ! mount "UUID=${UUID}" "$staging"; then
+    rmdir "$staging"
+    error "Could not mount new partition at staging path. Aborting migration."
+  fi
+
+  # ── rsync with progress ───────────────────────────────────────────────────
+  info "Copying data from '$MOUNT_PATH' → new disk (this may take a while)..."
+  if rsync -aAX --info=progress2 "$MOUNT_PATH"/ "$staging"/; then
+    success "Data copied successfully."
+  else
+    warn "rsync exited with errors. Unmounting staging and aborting."
+    umount "$staging" || true
+    rmdir  "$staging" || true
+    # Restore Docker even on failure so the system isn't left broken
+    docker_restore_if_needed
+    error "Data migration failed. Original data is untouched."
+  fi
+
+  # ── unmount staging area ──────────────────────────────────────────────────
+  umount "$staging"
+  rmdir  "$staging"
+  success "Staging mount released."
+
+  # ── rename old data as a backup ───────────────────────────────────────────
+  local backup_path="${MOUNT_PATH}.pre-migration-$(date -u +%Y%m%d%H%M%S)"
+  info "Renaming original data directory to '$backup_path' as a safety backup..."
+  mv "$MOUNT_PATH" "$backup_path"
+  success "Original data backed up to '$backup_path'."
+  warn "You may remove '$backup_path' once you have verified the new mount."
+}
+
+# ── Cleanup / rollback trap ───────────────────────────────────────────────────
+# If anything fatal happens after Docker was stopped, make sure it comes back.
+_emergency_restore() {
+  local exit_code=$?
+  if [[ $exit_code -ne 0 ]]; then
+    warn "Script exited with error ($exit_code). Attempting emergency Docker restore..."
+    docker_restore_if_needed || true
+  fi
+}
+trap '_emergency_restore' EXIT
+
+# =============================================================================
 echo -e "\n${BOLD}=== GCP Persistent Disk Setup ===${NC}"
 info "Disk       : $DISK"
 info "Mount path : $MOUNT_PATH"
@@ -44,17 +180,14 @@ info "Disk info:\n$DISK_INFO"
 # ── 2. Check if already in fstab (by device path or UUID) ────────────────────
 info "Checking fstab for existing entries..."
 
-# Gather UUID of the disk itself (pre-partition) and any partition UUIDs
 DISK_UUIDS=$(blkid -s UUID -o value "$DISK"* 2>/dev/null || true)
 
 ALREADY_IN_FSTAB=false
 
-# Check raw device path
 if grep -qE "^[[:space:]]*${DISK}[^[:space:]]*[[:space:]]" "$FSTAB" 2>/dev/null; then
   ALREADY_IN_FSTAB=true
 fi
 
-# Check by UUID
 if [[ -n "$DISK_UUIDS" ]]; then
   while IFS= read -r uuid; do
     if grep -q "$uuid" "$FSTAB" 2>/dev/null; then
@@ -64,7 +197,6 @@ if [[ -n "$DISK_UUIDS" ]]; then
   done <<< "$DISK_UUIDS"
 fi
 
-# Check by mount path
 if grep -qE "[[:space:]]${MOUNT_PATH}[[:space:]]" "$FSTAB" 2>/dev/null; then
   ALREADY_IN_FSTAB=true
   warn "Mount path '$MOUNT_PATH' already present in $FSTAB."
@@ -75,7 +207,6 @@ if $ALREADY_IN_FSTAB; then
   echo -e "\nCurrent fstab entries for this disk:"
   grep -E "(${DISK}|${MOUNT_PATH})" "$FSTAB" || true
 
-  # Still try to mount if not mounted
   if mountpoint -q "$MOUNT_PATH" 2>/dev/null; then
     success "'$MOUNT_PATH' is already mounted. Nothing to do."
     exit 0
@@ -90,12 +221,38 @@ fi
 # ── 3. Determine partition state ──────────────────────────────────────────────
 info "Inspecting partition table on '$DISK'..."
 
-PARTITION_COUNT=$(lsblk -n -o TYPE "$DISK" 2>/dev/null | grep -c '^part$' || true)
+# --raw suppresses the Unicode tree-drawing characters (└─ ├─) that lsblk
+# emits in its default output and that would otherwise corrupt the device path.
+# grep -c returns exit code 1 when there are zero matches, which would trip
+# set -euo pipefail. The || echo 0 ensures we always get a numeric value.
+PARTITION_COUNT=$(lsblk --raw -n -o TYPE "$DISK" 2>/dev/null | grep -c '^part$' || echo 0)
 EXISTING_PARTITION=""
 
 if [[ "$PARTITION_COUNT" -gt 0 ]]; then
-  # Use first existing partition
-  EXISTING_PARTITION=$(lsblk -n -o NAME,TYPE "$DISK" | awk '$2=="part"{print "/dev/"$1; exit}')
+  EXISTING_PARTITION=$(lsblk --raw -n -o NAME,TYPE "$DISK" \
+    | awk '$2=="part"{print "/dev/"$1; exit}')
+  # Defensive strip: remove any residual non-ASCII / non-printable bytes that
+  # some older lsblk versions still emit even with --raw.
+  EXISTING_PARTITION=$(printf '%s' "$EXISTING_PARTITION" | tr -cd '[:print:]')
+
+  # Sanity-check: the resolved path must actually be a block device.
+  if [[ -z "$EXISTING_PARTITION" || ! -b "$EXISTING_PARTITION" ]]; then
+    warn "lsblk reported a partition but '$EXISTING_PARTITION' is not a valid block device."
+    warn "Falling back to kernel sysfs enumeration..."
+    # Walk /sys/block/<dev>/*/dev to find partition block devices reliably.
+    DISK_BASE=$(basename "$DISK")
+    EXISTING_PARTITION=""
+    for part_sys in /sys/block/"$DISK_BASE"/"$DISK_BASE"*/; do
+      part_dev="/dev/$(basename "$part_sys")"
+      if [[ -b "$part_dev" ]]; then
+        EXISTING_PARTITION="$part_dev"
+        break
+      fi
+    done
+    [[ -n "$EXISTING_PARTITION" ]] \
+      || error "Could not resolve an existing partition on '$DISK' via sysfs either."
+  fi
+
   info "Found existing partition: $EXISTING_PARTITION"
 else
   info "No partitions found. Will create a new partition."
@@ -105,16 +262,13 @@ fi
 if [[ -z "$EXISTING_PARTITION" ]]; then
   info "Creating a single primary partition spanning the whole disk..."
 
-  # Wipe any stale signatures first (safe on a fresh PD)
   wipefs -a "$DISK" &>/dev/null || true
 
-  # Create GPT label + one partition
   parted -s "$DISK" mklabel gpt
   parted -s "$DISK" mkpart primary ext4 0% 100%
   partprobe "$DISK"
-  sleep 2  # let the kernel re-read
+  sleep 2
 
-  # Resolve partition name (/dev/sdb1 or /dev/nvme0n1p1, etc.)
   if [[ "$DISK" =~ nvme ]]; then
     PARTITION="${DISK}p1"
   else
@@ -143,16 +297,22 @@ UUID=$(blkid -s UUID -o value "$PARTITION")
 [[ -n "$UUID" ]] || error "Could not determine UUID for '$PARTITION'."
 success "UUID: $UUID"
 
-# ── 7. Create mount point ─────────────────────────────────────────────────────
+# ── 7. Migrate existing data (if any) ────────────────────────────────────────
+# Must run BEFORE we create the mount point and bind the new disk there.
+# UUID is now known, so the helper can use it for the staging mount.
+migrate_existing_data
+
+# ── 8. Create mount point ─────────────────────────────────────────────────────
+# After migration, the original directory was renamed, so recreate it cleanly.
 if [[ ! -d "$MOUNT_PATH" ]]; then
   info "Creating mount directory '$MOUNT_PATH'..."
   mkdir -p "$MOUNT_PATH"
   success "Directory created."
 else
-  info "Mount directory '$MOUNT_PATH' already exists."
+  info "Mount directory '$MOUNT_PATH' already exists (empty after migration)."
 fi
 
-# ── 8. Add to fstab ───────────────────────────────────────────────────────────
+# ── 9. Add to fstab ───────────────────────────────────────────────────────────
 FSTAB_ENTRY="UUID=${UUID}  ${MOUNT_PATH}  ext4  defaults,nofail  0  2"
 
 info "Backing up fstab to /etc/fstab.bak..."
@@ -166,16 +326,16 @@ success "fstab updated."
 
 echo -e "\nNew fstab entry:\n  ${BOLD}${FSTAB_ENTRY}${NC}\n"
 
-# ── 9. Test fstab mount ───────────────────────────────────────────────────────
+# ── 10. Test fstab mount ──────────────────────────────────────────────────────
 info "Testing fstab with 'mount -a'..."
 
-# Run mount -a and capture errors
 if MOUNT_ERR=$(mount -a 2>&1); then
   success "'mount -a' completed without errors."
 else
   warn "'mount -a' reported issues:\n$MOUNT_ERR"
   warn "Rolling back fstab to backup..."
   cp /etc/fstab.bak "$FSTAB"
+  docker_restore_if_needed
   error "fstab test failed — original fstab restored. Fix the issue and re-run."
 fi
 
@@ -183,18 +343,24 @@ fi
 if mountpoint -q "$MOUNT_PATH"; then
   success "'$MOUNT_PATH' is now mounted."
 else
-  # Attempt direct mount as a fallback
   warn "'$MOUNT_PATH' not yet mounted — attempting direct mount..."
   if mount "UUID=${UUID}" "$MOUNT_PATH"; then
     success "Mounted '$MOUNT_PATH' successfully."
   else
     warn "Rolling back fstab..."
     cp /etc/fstab.bak "$FSTAB"
+    docker_restore_if_needed
     error "Failed to mount '$MOUNT_PATH'. fstab restored."
   fi
 fi
 
-# ── 10. Summary ───────────────────────────────────────────────────────────────
+# ── 11. Restore Docker to original state ─────────────────────────────────────
+docker_restore_if_needed
+
+# Disable the trap's emergency handler now that we've restored cleanly
+trap - EXIT
+
+# ── 12. Summary ───────────────────────────────────────────────────────────────
 echo
 echo -e "${BOLD}${GREEN}=== Setup Complete ===${NC}"
 echo -e "  Disk      : $DISK"
@@ -202,6 +368,9 @@ echo -e "  Partition : $PARTITION"
 echo -e "  UUID      : $UUID"
 echo -e "  Mounted at: $MOUNT_PATH"
 echo -e "  fstab     : $FSTAB_ENTRY"
+if $DOCKER_WAS_RUNNING; then
+  echo -e "  Docker    : ${GREEN}restarted${NC} (was running before migration)"
+fi
 echo
 df -h "$MOUNT_PATH"
 echo

@@ -45,6 +45,17 @@ log()  { printf '%s\n' "$*" >&2; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Read from the terminal (works when script is piped: curl ... | sudo bash).
+read_tty() {
+	local prompt="$1"
+	local __var="$2"
+	if [[ ! -r /dev/tty ]]; then
+		die "No terminal for interactive input. Re-run with -y to skip confirmation."
+	fi
+	printf '%s' "$prompt" >&2
+	read -r "${__var?}" </dev/tty
+}
+
 require_root() {
 	[[ "${EUID:-$(id -u)}" -eq 0 ]] || die "This script must be run as root (sudo)."
 }
@@ -171,7 +182,7 @@ choose_disk_interactive() {
 
 	log ""
 	while true; do
-		read -r -p "Enter choice [1-${#disks[@]}]: " choice
+		read_tty "Enter choice [1-${#disks[@]}]: " choice
 		if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#disks[@]})); then
 			printf '%s\n' "${disks[$((choice - 1))]}"
 			return
@@ -488,7 +499,7 @@ confirm_resize() {
 		return 0
 	fi
 
-	read -r -p "Proceed with resize? [y/N]: " ans
+	read_tty "Proceed with resize? [y/N]: " ans
 	[[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]] || die "Aborted by user."
 }
 

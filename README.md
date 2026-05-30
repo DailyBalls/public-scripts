@@ -25,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/DailyBalls/public-scripts/main/setu
 ```bash
 # gcloud compute disks resize DISK_NAME --size=SIZE_GB --zone=ZONE
 curl -fsSL https://raw.githubusercontent.com/DailyBalls/public-scripts/main/resize-disk/resize-disk.sh \
-  | sudo bash -s -- -d /dev/sda -y
+  | sudo bash -s --
 ```
 
 See each folder’s README for options, examples, and details.

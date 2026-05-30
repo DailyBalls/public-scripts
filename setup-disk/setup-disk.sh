@@ -2,7 +2,7 @@
 # =============================================================================
 # setup-disk.sh — Partition, format, and fstab-mount a GCP Persistent Disk
 # Usage : curl -fsSL <raw-url> | sudo bash -s -- <disk> <mount-path>
-# Example: curl -fsSL https://raw.githubusercontent.com/DailyBalls/public-scripts/refs/heads/main/setup-disk.sh \
+# Example: curl -fsSL https://raw.githubusercontent.com/DailyBalls/public-scripts/refs/heads/main/setup-disk/setup-disk.sh \
 #            | sudo bash -s -- /dev/sdb /mnt/data
 #
 # New features:

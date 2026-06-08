@@ -13,11 +13,11 @@ Both scripts are meant to be run on the VM as root (`sudo`).
 
 ## Quick start
 
-**New data disk → mount at `/mnt/data`**
+**New data disk → mount at `/var/lib/docker`**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/DailyBalls/public-scripts/main/setup-disk/setup-disk.sh \
-  | sudo bash -s -- /dev/sdb /mnt/data
+  | sudo bash -s -- /dev/sdb /var/lib/docker
 ```
 
 **Disk already resized in GCP → use all space on the VM**

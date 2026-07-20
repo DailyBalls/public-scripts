@@ -8,6 +8,7 @@
 # New features:
 #   • Detects existing data in the target mount path and migrates it
 #   • Docker-aware: stops Docker before migrating /var/lib/docker, restores state
+#   • Installs missing required tools (parted, rsync, e2fsprogs, …) before proceeding
 # =============================================================================
 set -euo pipefail
 
@@ -32,6 +33,66 @@ FSTAB="/etc/fstab"
 
 # Normalise mount path (strip trailing slash) for reliable comparisons
 MOUNT_PATH="${MOUNT_PATH%/}"
+
+# ── Install required tools ────────────────────────────────────────────────────
+# command → package name (Debian/Ubuntu; RHEL family uses the same names here)
+ensure_dependencies() {
+  # cmd:pkg pairs — only packages for missing commands are installed
+  local -a needed=()
+  local cmd pkg
+
+  for pair in \
+    "parted:parted" \
+    "partprobe:parted" \
+    "rsync:rsync" \
+    "mkfs.ext4:e2fsprogs" \
+    "wipefs:util-linux" \
+    "blkid:util-linux" \
+    "lsblk:util-linux" \
+    "mountpoint:util-linux" \
+    "realpath:coreutils" \
+    "python3:python3"
+  do
+    cmd="${pair%%:*}"
+    pkg="${pair##*:}"
+    if ! command -v "$cmd" &>/dev/null; then
+      # Avoid duplicate package names in the install list
+      local already=false
+      local p
+      for p in "${needed[@]+"${needed[@]}"}"; do
+        [[ "$p" == "$pkg" ]] && already=true && break
+      done
+      $already || needed+=("$pkg")
+    fi
+  done
+
+  if [[ ${#needed[@]} -eq 0 ]]; then
+    info "All required tools are already installed."
+    return
+  fi
+
+  info "Missing tools — installing packages: ${needed[*]}"
+  export DEBIAN_FRONTEND=noninteractive
+
+  if command -v apt-get &>/dev/null; then
+    apt-get update -qq
+    apt-get install -y -qq "${needed[@]}"
+  elif command -v dnf &>/dev/null; then
+    dnf install -y "${needed[@]}"
+  elif command -v yum &>/dev/null; then
+    yum install -y "${needed[@]}"
+  else
+    error "Cannot install packages automatically. Install manually: ${needed[*]}"
+  fi
+
+  # Verify critical commands (python3 is optional; used only for daemon.json)
+  for cmd in parted partprobe rsync mkfs.ext4 wipefs blkid lsblk mountpoint realpath; do
+    command -v "$cmd" &>/dev/null \
+      || error "'$cmd' is still missing after package install. Aborting."
+  done
+
+  success "Required tools installed."
+}
 
 # ── Docker detection helpers ──────────────────────────────────────────────────
 DOCKER_DATA_ROOT="/var/lib/docker"   # canonical Docker data root
@@ -165,6 +226,10 @@ trap '_emergency_restore' EXIT
 echo -e "\n${BOLD}=== GCP Persistent Disk Setup ===${NC}"
 info "Disk       : $DISK"
 info "Mount path : $MOUNT_PATH"
+echo
+
+# ── 0. Ensure required tools are present ──────────────────────────────────────
+ensure_dependencies
 echo
 
 # ── 1. Check disk exists ──────────────────────────────────────────────────────

@@ -279,20 +279,90 @@ pick_grow_partition() {
 	printf '%s\n' "$part"
 }
 
-ensure_parted() {
-	command -v parted >/dev/null 2>&1 && return
-	log "parted not found; attempting to install..."
+# Install packages via the distro package manager.
+install_packages() {
+	[[ $# -gt 0 ]] || return 0
+	log "Installing packages: $*"
 	export DEBIAN_FRONTEND=noninteractive
 	if command -v apt-get >/dev/null 2>&1; then
-		apt-get update -qq && apt-get install -y -qq parted
+		apt-get update -qq
+		apt-get install -y -qq "$@"
 	elif command -v dnf >/dev/null 2>&1; then
-		dnf install -y parted
+		dnf install -y "$@"
 	elif command -v yum >/dev/null 2>&1; then
-		yum install -y parted
+		yum install -y "$@"
 	else
-		die "Install parted manually."
+		die "No supported package manager (apt/dnf/yum). Install manually: $*"
 	fi
-	command -v parted >/dev/null 2>&1 || die "parted still not available after install."
+}
+
+# Map a required command → package name(s) for apt and for dnf/yum.
+# Prints: <apt-pkg>|<rpm-pkg>  (same name when identical)
+pkg_for_cmd() {
+	case "$1" in
+	parted | partprobe) printf 'parted|parted\n' ;;
+	growpart)
+		# Debian/Ubuntu: cloud-guest-utils ; RHEL/Alma: cloud-utils-growpart
+		printf 'cloud-guest-utils|cloud-utils-growpart\n'
+		;;
+	resize2fs) printf 'e2fsprogs|e2fsprogs\n' ;;
+	xfs_growfs) printf 'xfsprogs|xfsprogs\n' ;;
+	btrfs) printf 'btrfs-progs|btrfs-progs\n' ;;
+	pvs | lvextend | lvs) printf 'lvm2|lvm2\n' ;;
+	lsblk | findmnt | blockdev | blkid | partx) printf 'util-linux|util-linux\n' ;;
+	numfmt) printf 'coreutils|coreutils\n' ;;
+	sfdisk) printf 'fdisk|util-linux\n' ;;
+	*) return 1 ;;
+	esac
+}
+
+# Ensure a command exists; install its package if missing.
+ensure_cmd() {
+	local cmd="$1" required="${2:-true}" mapping apt_pkg rpm_pkg
+	command -v "$cmd" >/dev/null 2>&1 && return 0
+
+	mapping="$(pkg_for_cmd "$cmd")" || {
+		[[ "$required" == "true" ]] && die "Required command not found: $cmd"
+		warn "Optional command not found: $cmd"
+		return 1
+	}
+	apt_pkg="${mapping%%|*}"
+	rpm_pkg="${mapping##*|}"
+
+	log "'$cmd' not found; attempting to install..."
+	if command -v apt-get >/dev/null 2>&1; then
+		install_packages "$apt_pkg"
+	else
+		install_packages "$rpm_pkg"
+	fi
+
+	if command -v "$cmd" >/dev/null 2>&1; then
+		return 0
+	fi
+	if [[ "$required" == "true" ]]; then
+		die "'$cmd' still not available after install (package: ${apt_pkg} / ${rpm_pkg})."
+	fi
+	warn "'$cmd' still not available; continuing without it."
+	return 1
+}
+
+# Tools needed for a successful resize on typical Debian/RHEL images.
+ensure_dependencies() {
+	ensure_cmd lsblk true
+	ensure_cmd findmnt true
+	ensure_cmd blockdev true
+	ensure_cmd blkid true
+	ensure_cmd parted true
+	ensure_cmd partprobe true
+	ensure_cmd numfmt false
+	ensure_cmd sfdisk false
+	ensure_cmd growpart false
+	# Filesystem / LVM tools — install when present on the target later;
+	# pull common ones now so online grow works without a second pass.
+	ensure_cmd resize2fs false
+	ensure_cmd xfs_growfs false
+	ensure_cmd btrfs false
+	ensure_cmd pvs false
 }
 
 # GCP docs: sudo parted /dev/sda → resizepart N → Yes → 100% → quit → partprobe
@@ -335,7 +405,6 @@ filesystem_on_whole_disk() {
 grow_partition_gcp() {
 	local disk="$1" partnum="$2"
 
-	ensure_parted
 	check_partition_table "$disk"
 
 	log "Resizing partition ${partnum} on ${disk} to 100% (parted resizepart)..."
@@ -373,12 +442,23 @@ lv_device_path() {
 extend_lvm_on_partition() {
 	local part="$1" pv vg_name root_src lv lv_path
 
+	# LVM tools are optional until we know this partition is a PV.
 	if ! command -v pvs >/dev/null 2>&1; then
-		return 0
+		# Probe without pvs: blkid TYPE=LVM2_member
+		local ptype
+		ptype="$(blkid -o value -s TYPE "$part" 2>/dev/null || true)"
+		if [[ "$ptype" == "LVM2_member" ]]; then
+			ensure_cmd pvs true
+		else
+			return 0
+		fi
 	fi
 
 	pv="$(pvs --noheadings -o pv_name 2>/dev/null | tr -d ' ' | grep -Fx "$part" || true)"
 	[[ -z "$pv" ]] && return 0
+
+	ensure_cmd lvextend true
+	ensure_cmd lvs true
 
 	log "Resizing physical volume $pv..."
 	pvresize "$pv"
@@ -457,15 +537,18 @@ grow_filesystem() {
 	# GCP: online grow only — no e2fsck on mounted ext4
 	case "$fstype" in
 	ext2 | ext3 | ext4)
+		ensure_cmd resize2fs true
 		resize2fs "$to_grow"
 		;;
 	xfs)
 		[[ -n "$mountpoint" ]] || die "XFS must be mounted to grow; mount ${to_grow} first."
+		ensure_cmd xfs_growfs true
 		# GCP: sudo xfs_growfs -d /
 		xfs_growfs -d "$mountpoint"
 		;;
 	btrfs)
 		[[ -n "$mountpoint" ]] || die "btrfs must be mounted to grow."
+		ensure_cmd btrfs true
 		# GCP: sudo btrfs filesystem resize max MOUNT_DIR
 		btrfs filesystem resize max "$mountpoint"
 		;;
@@ -506,9 +589,7 @@ confirm_resize() {
 main() {
 	parse_args "$@"
 	require_root
-
-	command -v lsblk >/dev/null 2>&1 || die "lsblk required (util-linux)."
-	command -v numfmt >/dev/null 2>&1 || warn "numfmt not found; sizes may be less readable."
+	ensure_dependencies
 
 	local disk part partnum free
 

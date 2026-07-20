@@ -5,7 +5,7 @@ Bash scripts for **GCP Persistent Disk** tasks on Linux VMs (Debian, Ubuntu, Alm
 | Script | Use when |
 |---|---|
 | [setup-disk](setup-disk/README.md) | Attach a **new** disk — partition, format, mount, and add to `/etc/fstab` |
-| [setup-docker-disk](setup-docker-disk/README.md) | Use a **new** disk for Docker **and** containerd (`data-root` + containerd `root`) |
+| [setup-docker-disk](setup-docker-disk/README.md) | Use a **new** disk for Docker **and** containerd via bind mounts to `/var/lib/docker` + `/var/lib/containerd` |
 | [resize-disk](resize-disk/README.md) | **Grow** a disk after increasing its size in GCP — extend partition and filesystem |
 
 These scripts are meant to be run on the VM as root (`sudo`).

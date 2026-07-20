@@ -371,8 +371,10 @@ echo
 ensure_mount
 echo
 
-mkdir -p "$DISK_DOCKER" "$DISK_CONTAINERD"
-success "Created '$DISK_DOCKER' and '$DISK_CONTAINERD'."
+mkdir -p "$DISK_DOCKER" "$DISK_CONTAINERD" "$DOCKER_LIB" "$CONTAINERD_LIB"
+success "Created on-disk dirs and bind targets:"
+info "  $DISK_DOCKER → $DOCKER_LIB"
+info "  $DISK_CONTAINERD → $CONTAINERD_LIB"
 
 stop_docker_stack
 echo
@@ -381,10 +383,11 @@ migrate_lib_to_disk "$DOCKER_LIB" "$DISK_DOCKER" "Docker"
 migrate_lib_to_disk "$CONTAINERD_LIB" "$DISK_CONTAINERD" "containerd"
 echo
 
-ensure_fstab_bind "$DISK_DOCKER" "$DOCKER_LIB"
-ensure_fstab_bind "$DISK_CONTAINERD" "$CONTAINERD_LIB"
+# Mount first so paths exist and work; only then persist in fstab
 bind_mount_now "$DISK_DOCKER" "$DOCKER_LIB"
 bind_mount_now "$DISK_CONTAINERD" "$CONTAINERD_LIB"
+ensure_fstab_bind "$DISK_DOCKER" "$DOCKER_LIB"
+ensure_fstab_bind "$DISK_CONTAINERD" "$CONTAINERD_LIB"
 echo
 
 restore_default_docker_paths

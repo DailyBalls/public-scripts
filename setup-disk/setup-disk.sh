@@ -393,33 +393,40 @@ success "fstab updated."
 
 echo -e "\nNew fstab entry:\n  ${BOLD}${FSTAB_ENTRY}${NC}\n"
 
-# ── 10. Test fstab mount ──────────────────────────────────────────────────────
-info "Testing fstab with 'mount -a'..."
+# ── 10. Mount the new filesystem (do not rely on mount -a alone) ──────────────
+# mount -a activates every fstab entry. Pre-existing bind mounts (e.g. from
+# setup-docker-disk) can fail if their targets are missing and would incorrectly
+# abort this script. Mount our UUID entry directly instead.
+info "Mounting UUID=${UUID} at '$MOUNT_PATH'..."
+mkdir -p "$MOUNT_PATH"
 
-if MOUNT_ERR=$(mount -a 2>&1); then
-  success "'mount -a' completed without errors."
+if mountpoint -q "$MOUNT_PATH" 2>/dev/null; then
+  success "'$MOUNT_PATH' is already mounted."
+elif MOUNT_ERR=$(mount "UUID=${UUID}" "$MOUNT_PATH" 2>&1); then
+  success "'$MOUNT_PATH' is now mounted."
 else
-  warn "'mount -a' reported issues:\n$MOUNT_ERR"
+  warn "Mount failed:\n$MOUNT_ERR"
   warn "Rolling back fstab to backup..."
   cp /etc/fstab.bak "$FSTAB"
   docker_restore_if_needed
-  error "fstab test failed — original fstab restored. Fix the issue and re-run."
+  error "Failed to mount '$MOUNT_PATH'. fstab restored."
 fi
 
-# Verify the mount point is actually mounted
-if mountpoint -q "$MOUNT_PATH"; then
-  success "'$MOUNT_PATH' is now mounted."
+# Best-effort: bring up other fstab entries without failing this script
+if MOUNT_ERR=$(mount -a 2>&1); then
+  success "'mount -a' completed without errors."
 else
-  warn "'$MOUNT_PATH' not yet mounted — attempting direct mount..."
-  if mount "UUID=${UUID}" "$MOUNT_PATH"; then
-    success "Mounted '$MOUNT_PATH' successfully."
-  else
-    warn "Rolling back fstab..."
-    cp /etc/fstab.bak "$FSTAB"
-    docker_restore_if_needed
-    error "Failed to mount '$MOUNT_PATH'. fstab restored."
-  fi
+  warn "'mount -a' reported issues with other fstab entries (ignored):\n$MOUNT_ERR"
+  warn "Our mount at '$MOUNT_PATH' is OK — fix the other entries separately if needed."
 fi
+
+if ! mountpoint -q "$MOUNT_PATH"; then
+  warn "Rolling back fstab..."
+  cp /etc/fstab.bak "$FSTAB"
+  docker_restore_if_needed
+  error "'$MOUNT_PATH' is not a mount point after mount attempt. fstab restored."
+fi
+success "'$MOUNT_PATH' mount verified."
 
 # ── 11. Restore Docker to original state ─────────────────────────────────────
 docker_restore_if_needed

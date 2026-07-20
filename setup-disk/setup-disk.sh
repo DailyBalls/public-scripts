@@ -381,9 +381,17 @@ fi
 
 # ── 9. Add to fstab ───────────────────────────────────────────────────────────
 FSTAB_ENTRY="UUID=${UUID}  ${MOUNT_PATH}  ext4  defaults,nofail  0  2"
+FSTAB_BACKUP_TS="$(date -u +%Y%m%d%H%M%S)"
 
 info "Backing up fstab to /etc/fstab.bak..."
 cp "$FSTAB" /etc/fstab.bak
+cp "$FSTAB" "/etc/fstab.before-${FSTAB_BACKUP_TS}"
+
+# If the target is already mounted (re-run / existing disk), keep a copy on it too
+if mountpoint -q "$MOUNT_PATH" 2>/dev/null; then
+  cp "$FSTAB" "${MOUNT_PATH}/fstab.before-${FSTAB_BACKUP_TS}"
+  success "fstab (before) also saved to ${MOUNT_PATH}/fstab.before-${FSTAB_BACKUP_TS}"
+fi
 
 info "Adding entry to $FSTAB..."
 echo "" >> "$FSTAB"
@@ -427,6 +435,12 @@ if ! mountpoint -q "$MOUNT_PATH"; then
   error "'$MOUNT_PATH' is not a mount point after mount attempt. fstab restored."
 fi
 success "'$MOUNT_PATH' mount verified."
+
+# Persist post-change fstab on the data disk (and under /etc)
+cp "$FSTAB" "/etc/fstab.after-${FSTAB_BACKUP_TS}"
+cp "$FSTAB" "${MOUNT_PATH}/fstab.after-${FSTAB_BACKUP_TS}"
+success "fstab (after) saved to ${MOUNT_PATH}/fstab.after-${FSTAB_BACKUP_TS}"
+info "Also saved: /etc/fstab.after-${FSTAB_BACKUP_TS}"
 
 # ── 11. Restore Docker to original state ─────────────────────────────────────
 docker_restore_if_needed

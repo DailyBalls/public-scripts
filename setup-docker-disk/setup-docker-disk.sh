@@ -259,6 +259,28 @@ ensure_fstab_bind() {
   success "fstab updated for '$target'."
 }
 
+# Copy /etc/fstab onto the data disk (and /etc) with a before/after label.
+backup_fstab_to_disk() {
+  local phase="$1"  # before | after
+  local ts dest etc_dest
+  ts="$(date -u +%Y%m%d%H%M%S)"
+  dest="${MOUNT_PATH}/fstab.${phase}-${ts}"
+  etc_dest="/etc/fstab.${phase}-docker-disk-${ts}"
+
+  if ! mountpoint -q "$MOUNT_PATH" 2>/dev/null; then
+    warn "Cannot backup fstab to '$MOUNT_PATH' — not mounted. Saving to $etc_dest only."
+    cp "$FSTAB" "$etc_dest"
+    success "fstab ($phase) backed up to $etc_dest"
+    return
+  fi
+
+  cp "$FSTAB" "$dest"
+  cp "$FSTAB" "$etc_dest"
+  success "fstab ($phase) backed up to $dest"
+  info "Also saved: $etc_dest"
+}
+
+
 bind_mount_now() {
   local source="$1"
   local target="$2"
@@ -386,8 +408,11 @@ echo
 # Mount first so paths exist and work; only then persist in fstab
 bind_mount_now "$DISK_DOCKER" "$DOCKER_LIB"
 bind_mount_now "$DISK_CONTAINERD" "$CONTAINERD_LIB"
+
+backup_fstab_to_disk "before"
 ensure_fstab_bind "$DISK_DOCKER" "$DOCKER_LIB"
 ensure_fstab_bind "$DISK_CONTAINERD" "$CONTAINERD_LIB"
+backup_fstab_to_disk "after"
 echo
 
 restore_default_docker_paths

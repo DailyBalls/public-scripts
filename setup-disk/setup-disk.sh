@@ -288,9 +288,11 @@ info "Inspecting partition table on '$DISK'..."
 
 # --raw suppresses the Unicode tree-drawing characters (└─ ├─) that lsblk
 # emits in its default output and that would otherwise corrupt the device path.
-# grep -c returns exit code 1 when there are zero matches, which would trip
-# set -euo pipefail. The || echo 0 ensures we always get a numeric value.
-PARTITION_COUNT=$(lsblk --raw -n -o TYPE "$DISK" 2>/dev/null | grep -c '^part$' || echo 0)
+# grep -c prints 0 on no match but exits 1; with pipefail that would abort.
+# Use || true — NOT || echo 0 — or stdout becomes "0\n0" and breaks [[ -gt ]].
+PARTITION_COUNT=$(lsblk --raw -n -o TYPE "$DISK" 2>/dev/null | grep -c '^part$' || true)
+PARTITION_COUNT="${PARTITION_COUNT//$'\n'/}"
+PARTITION_COUNT="${PARTITION_COUNT:-0}"
 EXISTING_PARTITION=""
 
 if [[ "$PARTITION_COUNT" -gt 0 ]]; then
